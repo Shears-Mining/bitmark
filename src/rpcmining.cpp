@@ -732,6 +732,125 @@ Value submitblock(const Array& params, bool fHelp)
 }
 
 #ifdef ENABLE_WALLET
+
+// ---- Shears Mining: createauxblock / submitauxblock (work paid to a given address) ----
+static CCriticalSection cs_createAux;
+static std::map<uint256, CBlock*> mapCreateAuxBlock;
+static std::map<std::string, std::pair<CBlock*, int64_t> > mapCreateAuxByAddr;
+static std::vector<CBlockTemplate*> vCreateAuxTemplates;
+static CBlockIndex* pindexCreateAux = NULL;
+static unsigned int nCreateAuxTxUpdated = 0;
+static int nCreateAuxAlgo = -1;
+
+Value createauxblock(const Array& params, bool fHelp)
+{
+  if (fHelp || params.size() != 1)
+    throw runtime_error(
+      "createauxblock <address>\n"
+      "\nCreate a new block paying its coinbase to <address> and return the\n"
+      "information needed to merge-mine it (same fields as getauxblock).\n");
+  CBitmarkAddress address(params[0].get_str());
+  if (!address.IsValid())
+    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bitmark address");
+  if (vNodes.empty())
+    throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Bitmark is not connected!");
+  if (IsInitialBlockDownload())
+    throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "Bitmark is downloading blocks...");
+
+  LOCK(cs_createAux);
+  CBlock* pblock = NULL;
+  int nHeight = 0;
+  {
+    LOCK(cs_main);
+    if (pindexCreateAux != chainActive.Tip() || nCreateAuxAlgo != miningAlgo) {
+      mapCreateAuxBlock.clear();
+      mapCreateAuxByAddr.clear();
+      BOOST_FOREACH(CBlockTemplate* pbt, vCreateAuxTemplates)
+        delete pbt;
+      vCreateAuxTemplates.clear();
+      pindexCreateAux = chainActive.Tip();
+      nCreateAuxTxUpdated = mempool.GetTransactionsUpdated();
+      nCreateAuxAlgo = miningAlgo;
+    }
+    const std::string key = address.ToString();
+    std::map<std::string, std::pair<CBlock*, int64_t> >::iterator it = mapCreateAuxByAddr.find(key);
+    bool fFresh = (it != mapCreateAuxByAddr.end())
+      && !(mempool.GetTransactionsUpdated() != nCreateAuxTxUpdated && GetTime() - it->second.second > 60);
+    if (fFresh) {
+      pblock = it->second.first;
+    } else {
+      if (vCreateAuxTemplates.size() > 2000)
+        throw JSONRPCError(RPC_OUT_OF_MEMORY, "too many pending aux blocks");
+      CScript scriptPubKey;
+      scriptPubKey.SetDestination(address.Get());
+      CBlockTemplate* pblocktemplate = CreateNewBlock(scriptPubKey);
+      if (!pblocktemplate)
+        throw JSONRPCError(RPC_OUT_OF_MEMORY, "out of memory");
+      vCreateAuxTemplates.push_back(pblocktemplate);
+      pblock = &pblocktemplate->block;
+      unsigned int nExtraNonce = 0;
+      IncrementExtraNonce(pblock, pindexCreateAux, nExtraNonce);
+      pblock->SetAuxpow(true);
+      pblock->SetChainId(Params().GetAuxpowChainId());
+      pblock->hashMerkleRoot = pblock->BuildMerkleTree();
+      mapCreateAuxBlock[pblock->GetHash()] = pblock;
+      mapCreateAuxByAddr[key] = std::make_pair(pblock, GetTime());
+      nCreateAuxTxUpdated = mempool.GetTransactionsUpdated();
+    }
+    nHeight = pindexCreateAux->nHeight + 1;
+  }
+
+  const CBlock& block = *pblock;
+  uint256 hashTarget = CBigNum().SetCompact(block.nBits).getuint256();
+  json_spirit::Object result;
+  result.push_back(Pair("hash", block.GetHash().GetHex()));
+  result.push_back(Pair("chainid", block.GetChainId()));
+  result.push_back(Pair("previousblockhash", block.hashPrevBlock.GetHex()));
+  result.push_back(Pair("coinbasevalue", (int64_t)block.vtx[0].vout[0].nValue));
+  result.push_back(Pair("address", address.ToString()));
+  result.push_back(Pair("bits", strprintf("%08x", block.nBits)));
+  result.push_back(Pair("height", static_cast<int64_t>(nHeight)));
+  result.push_back(Pair("target", HexStr(BEGIN(hashTarget), END(hashTarget))));
+  return result;
+}
+
+Value submitauxblock(const Array& params, bool fHelp)
+{
+  if (fHelp || params.size() != 2)
+    throw runtime_error(
+      "submitauxblock <hash> <auxpow>\n"
+      "\nSubmit a solved auxpow for a block returned by createauxblock.\n"
+      "Returns true if the block was accepted.\n");
+  uint256 hash;
+  hash.SetHex(params[0].get_str());
+  const std::vector<unsigned char> vchAuxPow = ParseHex(params[1].get_str());
+
+  LOCK(cs_createAux);
+  std::map<uint256, CBlock*>::iterator mit = mapCreateAuxBlock.find(hash);
+  if (mit == mapCreateAuxBlock.end())
+    throw JSONRPCError(RPC_INVALID_PARAMETER, "block hash unknown");
+  CBlock& block = *mit->second;
+
+  CDataStream ss(vchAuxPow, SER_GETHASH, PROTOCOL_VERSION);
+  CAuxPow pow;
+  if (block.GetAlgo()==ALGO_EQUIHASH || block.GetAlgo()==ALGO_CRYPTONIGHT)
+    pow.vector_format = true;
+  if (block.GetAlgo()==ALGO_CRYPTONIGHT) {
+    pow.parentBlock.vector_format = true;
+    pow.keccak_hash = true;
+  }
+  pow.parentBlock.algoParent = block.GetAlgo();
+  pow.parentBlock.isParent = true;
+  ss >> pow;
+  block.SetAuxpow(new CAuxPow(pow));
+  if (block.GetHash() != hash)
+    throw JSONRPCError(RPC_INTERNAL_ERROR, "block hash changed");
+
+  CValidationState state;
+  bool fAccepted = ProcessBlock(state, NULL, &block);
+  return fAccepted;
+}
+// ---- end Shears Mining ----
 Value getauxblock(const Array& params, bool fHelp)
 {
   if (fHelp || (params.size() != 0 && params.size() != 2))
