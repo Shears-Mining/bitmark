@@ -181,6 +181,9 @@ AC_LANG_PUSH([C++])
 AX_CHECK_COMPILE_FLAG([-std=c++11], [CXXFLAGS="$CXXFLAGS -std=c++11"])
 AX_CHECK_COMPILE_FLAG([-fPIC], [CXXFLAGS="$CXXFLAGS -fPIC"])
 CFLAGS="$CFLAGS -fPIC"
+# Shears Mining: old Lyra2REv2 code breaks under strict aliasing with modern GCC (wrong, random hashes)
+CFLAGS="$CFLAGS -fno-strict-aliasing"
+CXXFLAGS="$CXXFLAGS -fno-strict-aliasing"
 
 ## CPU-specific flags
 case $host in
